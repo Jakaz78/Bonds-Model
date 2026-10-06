@@ -1,0 +1,517 @@
+---
+title: "Sprawozdanie"
+subtitle: "Model ekonometryczny rentowności 10-letnich polskich obligacji skarbowych"
+author: "Jakub Kaźmierczyk"
+date: "`r format(Sys.Date(), '%d.%m.%Y')`"
+output:
+  pdf_document:
+    toc: true
+    toc_depth: 3
+    number_sections: true
+    latex_engine: xelatex
+    highlight: tango
+fontsize: 11pt
+geometry: margin=2.5cm
+linestretch: 1.4
+lang: "pl"
+header-includes:
+  - \renewcommand{\contentsname}{Spis treści}
+  - \usepackage{fancyhdr}
+  - \pagestyle{fancy}
+  - \fancyhf{}
+  - \cfoot{\thepage}
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, warning = FALSE, message = FALSE,
+                      comment = NA, fig.align = "center", dev = "cairo_pdf")
+
+library(readxl)       # wczytanie danych
+library(zoo)          # interpolacja braków
+library(tseries)      # testy ADF, KPSS, Jarque-Bera, serii
+library(lmtest)       # Durbin-Watson, Breusch-Godfrey, Breusch-Pagan, Goldfeld-Quandt
+library(car)          # VIF
+library(strucchange)  # Chow, CUSUM
+library(corrplot)     # macierze korelacji
+library(ggplot2)      # wykresy szeregów
+library(gridExtra)    # układ wykresów
+
+# ---- Parametry analizy (zmieniaj tutaj) -------------------------------------
+PLIK_DANYCH <- "data/data.xlsx"
+ALFA        <- 0.05   # poziom istotności
+PODZIAL     <- 0.8    # udział próby uczącej
+R_MIN       <- 0.3    # odrzucamy zmienne o |r| z CLOSE poniżej tego progu
+R_MAX       <- 0.75   # odrzucamy zmienne o |r| z CLOSE powyżej tego progu
+MAX_ROZN    <- 2      # maksymalny rząd różnicowania
+
+# ---- Funkcje pomocnicze (formatowanie z przecinkiem dziesiętnym) -----------
+fmt   <- function(x, d = 3) formatC(x, format = "f", digits = d, decimal.mark = ",")
+fmt_p <- function(p) ifelse(p < 0.001, "< 0,001", paste("=", fmt(p, 3)))
+wniosek_h0 <- function(p) ifelse(p < ALFA, "odrzucamy H0", "brak podstaw do odrzucenia H0")
+```
+
+# Wprowadzenie
+
+## Cel projektu
+
+Celem projektu jest budowa modelu ekonometrycznego opisującego zmiany rentowności 10-letnich polskich obligacji skarbowych na podstawie miesięcznych szeregów czasowych oraz ocena jego własności statystycznych i zdolności prognostycznych.
+
+## Zmienne
+
+**Zmienna objaśniana**
+
+- **CLOSE** – rentowność 10-letnich polskich obligacji skarbowych
+
+**Zmienne objaśniające**
+
+- **DE10Y** (`10YDEBOND`) – rentowność 10-letnich niemieckich obligacji skarbowych
+- **US10Y** (`10YUSBOND`) – rentowność 10-letnich amerykańskich obligacji skarbowych
+- **DETAL** – sprzedaż detaliczna, zmiana miesiąc do miesiąca
+- **XAUUSD** – cena złota w dolarach amerykańskich
+- **SP500** (`S&P500`) – indeks 500 największych spółek notowanych na giełdzie amerykańskiej
+- **PMI** – wskaźnik aktywności w przemyśle
+- **WIG20** – indeks 20 największych spółek notowanych na GPW
+- **OIL** – cena ropy naftowej za baryłkę
+- **USDPLN** – kurs dolara amerykańskiego wyrażony w złotych
+- **INFLATION** – inflacja rok do roku
+- **WIBOR** – referencyjna stopa procentowa polskiego rynku międzybankowego
+
+Nazwy `10YDEBOND`, `10YUSBOND` i `S&P500` zostały w analizie zmienione na `DE10Y`, `US10Y` i `SP500`, aby były poprawnymi nazwami zmiennych w formułach R.
+
+## Źródło danych
+
+Dane pochodzą z serwisu [stooq.pl](https://stooq.pl).
+
+# Wczytanie i podział danych
+
+```{r dane}
+surowe <- read_excel(PLIK_DANYCH)
+daty   <- as.Date(surowe$Date)
+dane   <- as.data.frame(surowe[, -1], check.names = FALSE)
+names(dane) <- sub("^S&P500$", "SP500", names(dane))
+names(dane) <- sub("^10YDEBOND$", "DE10Y", names(dane))
+names(dane) <- sub("^10YUSBOND$", "US10Y", names(dane))
+
+liczba_brakow <- sum(is.na(dane))
+dane[] <- lapply(dane, na.approx, na.rm = FALSE)   # interpolacja liniowa braków
+
+n     <- nrow(dane)
+n_ucz <- floor(PODZIAL * n)
+ucz   <- dane[1:n_ucz, ]
+```
+
+Zbiór zawiera `r n` obserwacji miesięcznych (od `r format(min(daty), "%m.%Y")` do `r format(max(daty), "%m.%Y")`) dla `r ncol(dane) - 1` zmiennych objaśniających. Liczba braków danych: `r liczba_brakow` (uzupełnione interpolacją liniową funkcją `na.approx`).
+
+Dane podzielono chronologicznie na część **uczącą** (pierwsze `r n_ucz` obserwacji, `r round(100 * PODZIAL)` %) i **testową** (pozostałe `r n - n_ucz` obserwacji). Wszystkie decyzje dotyczące doboru zmiennych i przekształceń podejmowane są wyłącznie na danych uczących.
+
+# Podstawowe statystyki
+
+```{r statystyki}
+tab <- t(sapply(ucz, function(x) c(summary(x), "Odch.std." = sd(x))))
+colnames(tab) <- c("Min.", "Q1", "Mediana", "Średnia", "Q3", "Maks.", "Odch. std.")
+knitr::kable(round(tab, 3), caption = "Statystyki opisowe (próba ucząca)")
+```
+
+Mediana rentowności 10-letnich polskich obligacji wynosi `r fmt(median(ucz$CLOSE))` %, a średnia `r fmt(mean(ucz$CLOSE))` %. Średnia `r ifelse(mean(ucz$CLOSE) > median(ucz$CLOSE), "przewyższa medianę, co wskazuje na niewielką skośność prawostronną", "jest niższa od mediany, co wskazuje na niewielką skośność lewostronną")` rozkładu. Rentowność przyjmowała wartości od `r fmt(min(ucz$CLOSE))` % do `r fmt(max(ucz$CLOSE))` % (rozstęp `r fmt(diff(range(ucz$CLOSE)))` p.p.), a połowa obserwacji mieści się w przedziale od `r fmt(quantile(ucz$CLOSE, .25))` % do `r fmt(quantile(ucz$CLOSE, .75))` %.
+
+# Dobór zmiennych na podstawie korelacji
+
+## Macierz korelacji przed selekcją
+
+```{r kor-przed, fig.width=7, fig.height=7}
+corrplot(cor(ucz), method = "color", order = "alphabet",
+         addCoef.col = "black", tl.col = "black",
+         tl.cex = 0.8, cl.cex = 0.8, number.cex = 0.6)
+```
+
+## Selekcja
+
+Z modelu usuwane są zmienne, których bezwzględna korelacja z `CLOSE` wynosi mniej niż `r fmt(R_MIN, 2)` (zbyt słaba zależność) lub więcej niż `r fmt(R_MAX, 2)`. Zmienne muszą także przyjmować wyłącznie wartości dodatnie, ponieważ w kolejnym kroku są logarytmowane.
+
+```{r filtr}
+zmienne <- setdiff(names(ucz), "CLOSE")
+r_y     <- sapply(zmienne, function(v) abs(cor(ucz[[v]], ucz$CLOSE)))
+min_dod <- sapply(zmienne, function(v) all(dane[[v]] > 0))
+
+powod <- ifelse(r_y < R_MIN, "zbyt słaba korelacja z CLOSE",
+         ifelse(r_y > R_MAX, "zbyt silna korelacja z CLOSE",
+         ifelse(!min_dod,    "wartości niedodatnie (brak logarytmu)", "zachowana")))
+
+knitr::kable(data.frame(Zmienna = zmienne, `|r| z CLOSE` = round(r_y, 3),
+                        Decyzja = powod, check.names = FALSE),
+             row.names = FALSE, caption = "Selekcja zmiennych")
+
+wybrane <- zmienne[powod == "zachowana"]
+```
+
+Po selekcji pozostało `r length(wybrane)` zmiennych objaśniających: `r paste(wybrane, collapse = ", ")`.
+
+## Macierz korelacji po selekcji
+
+```{r kor-po, fig.width=5, fig.height=5}
+corrplot(cor(ucz[, c("CLOSE", wybrane)]), method = "color", order = "alphabet",
+         addCoef.col = "black", tl.col = "black",
+         tl.cex = 0.9, cl.cex = 0.8, number.cex = 0.8)
+```
+
+## Logarytmowanie
+
+```{r log}
+logd <- log(dane[, c("CLOSE", wybrane)])
+```
+
+# Stacjonarność
+
+Szereg uznajemy za stacjonarny, gdy test ADF odrzuca hipotezę o istnieniu pierwiastka jednostkowego (p < `r fmt(ALFA, 2)`) **oraz** test KPSS nie odrzuca hipotezy o stacjonarności (p > `r fmt(ALFA, 2)`). Szeregi niestacjonarne są różnicowane, aż spełnią oba warunki (maksymalnie `r MAX_ROZN` razy). Rząd różnicowania jest wyznaczany na próbie uczącej i następnie stosowany do całego szeregu.
+
+```{r stacjonarnosc}
+czy_stacjonarny <- function(x) {
+  adf  <- suppressWarnings(adf.test(x)$p.value)
+  kpss <- suppressWarnings(kpss.test(x)$p.value)
+  adf < ALFA && kpss > ALFA
+}
+
+rzad_roznicowania <- function(x) {
+  for (d in 0:MAX_ROZN) {
+    z <- if (d == 0) x else diff(x, differences = d)
+    if (czy_stacjonarny(z)) return(d)
+  }
+  MAX_ROZN
+}
+
+roznicuj <- function(x, d) if (d == 0) x else c(rep(NA, d), diff(x, differences = d))
+
+rzedy <- sapply(logd[1:n_ucz, ], rzad_roznicowania)
+
+nazwy_st <- ifelse(rzedy == 0, names(rzedy),
+                   paste0("D", ifelse(rzedy > 1, rzedy, ""), "_", names(rzedy)))
+
+st <- as.data.frame(mapply(roznicuj, logd, rzedy, SIMPLIFY = FALSE))
+names(st) <- nazwy_st
+
+# Różnicowanie skraca szereg – odrzucamy początkowe obserwacje z brakami
+start   <- max(rzedy) + 1
+indeks  <- start:n
+st      <- st[indeks, ]
+st_ucz  <- st[indeks <= n_ucz, ]
+st_test <- st[indeks >  n_ucz, ]
+Y       <- nazwy_st[["CLOSE"]]
+```
+
+```{r tab-stac}
+po <- sapply(st_ucz, czy_stacjonarny)
+knitr::kable(data.frame(
+  Zmienna = names(rzedy),
+  `Stacjonarna przed różnicowaniem` = ifelse(rzedy == 0, "tak", "nie"),
+  `Rząd różnicowania` = rzedy,
+  `Zmienna po transformacji` = nazwy_st,
+  `Stacjonarna po transformacji` = ifelse(po, "tak", "nie"),
+  check.names = FALSE), row.names = FALSE, caption = "Wyniki testów stacjonarności")
+```
+
+`r if (all(po)) "Po transformacji wszystkie szeregi są stacjonarne." else paste("**Uwaga:** po transformacji nadal niestacjonarne są:", paste(names(po)[!po], collapse = ", "), "– wyniki modelu należy interpretować ostrożnie.")`
+
+```{r wykresy-stac, fig.width=8, fig.height=2.2 * length(rzedy)}
+wykres <- function(y, x_daty, tytul, kolor) {
+  ggplot(data.frame(t = x_daty, y = as.numeric(y)), aes(t, y)) +
+    geom_line(colour = kolor, linewidth = 0.6) +
+    labs(title = tytul, x = NULL, y = NULL) +
+    theme_minimal() + theme(plot.title = element_text(size = 9, face = "bold"))
+}
+lista <- list()
+for (v in names(rzedy)) {
+  lista[[length(lista) + 1]] <- wykres(logd[[v]], daty, paste0("Przed: ln(", v, ")"), "blue")
+  lista[[length(lista) + 1]] <- wykres(st[[nazwy_st[[v]]]], daty[indeks],
+                                       paste0("Po: ", nazwy_st[[v]]), "red")
+}
+grid.arrange(grobs = lista, ncol = 2)
+```
+
+## Korelacje po transformacji
+
+```{r kor-st, fig.width=5, fig.height=5}
+corrplot(cor(st_ucz), method = "color", order = "alphabet",
+         addCoef.col = "black", tl.col = "black",
+         tl.cex = 0.9, cl.cex = 0.8, number.cex = 0.8)
+```
+
+# Metoda Hellwiga
+
+Metoda pojemności integralnej nośników informacji Hellwiga wybiera taką kombinację zmiennych objaśniających, która ma największą korelację ze zmienną objaśnianą przy jednoczesnej niskiej korelacji wzajemnej. Przeglądane są wszystkie niepuste podzbiory zmiennych.
+
+```{r hellwig}
+hellwig <- function(y, X) {
+  nazwy <- colnames(X)
+  R  <- cor(cbind(y = y, X))
+  r0 <- R[-1, 1]
+  Rxx <- R[-1, -1, drop = FALSE]
+  wyniki <- list()
+  for (m in seq_along(nazwy)) {
+    for (kombinacja in combn(nazwy, m, simplify = FALSE)) {
+      i <- match(kombinacja, nazwy)
+      h <- sapply(seq_along(i), function(j) {
+        mianownik <- if (length(i) == 1) 1 else 1 + sum(abs(Rxx[i[j], i[-j]]))
+        r0[i[j]]^2 / mianownik
+      })
+      wyniki[[paste(kombinacja, collapse = ", ")]] <- sum(h)
+    }
+  }
+  w <- data.frame(Zmienne = names(wyniki), Pojemnosc = unlist(wyniki), row.names = NULL)
+  w[order(-w$Pojemnosc), ]
+}
+
+X_nazwy  <- setdiff(names(st_ucz), Y)
+hel      <- hellwig(st_ucz[[Y]], st_ucz[, X_nazwy, drop = FALSE])
+najlepsze <- strsplit(hel$Zmienne[1], ", ")[[1]]
+
+knitr::kable(setNames(transform(head(hel, 5), Pojemnosc = round(Pojemnosc, 4)),
+                      c("Zmienne", "Pojemność")),
+             row.names = FALSE, caption = "Pięć najlepszych kombinacji (pojemność Hellwiga)")
+```
+
+Najwyższą pojemność (`r fmt(hel$Pojemnosc[1], 4)`) ma kombinacja: **`r paste(najlepsze, collapse = ", ")`**. Te zmienne wchodzą do modelu.
+
+# Model
+
+```{r model}
+formula_modelu <- reformulate(najlepsze, response = Y)
+model  <- lm(formula_modelu, data = st_ucz)
+sm     <- summary(model)
+reszty <- residuals(model)
+dopas  <- fitted(model)
+n_obs  <- length(reszty)
+f_p    <- pf(sm$fstatistic[1], sm$fstatistic[2], sm$fstatistic[3], lower.tail = FALSE)
+
+knitr::kable(round(sm$coefficients, 5), caption = "Oszacowania parametrów modelu (MNK)")
+```
+
+Model ma postać:
+
+$$`r paste0("\\text{", gsub("_", "\\\\_", Y), "} = ", fmt(coef(model)[1], 4), paste0(ifelse(coef(model)[-1] >= 0, " + ", " - "), fmt(abs(coef(model)[-1]), 4), " \\cdot \\text{", gsub("_", "\\\\_", najlepsze), "}", collapse = ""), " + \\varepsilon")`$$
+
+Statystyka F wynosi `r fmt(sm$fstatistic[1], 2)` (p `r fmt_p(f_p)`), więc `r ifelse(f_p < ALFA, "model jako całość jest istotny statystycznie", "model jako całość nie jest istotny statystycznie")`. Współczynnik determinacji $R^2$ = `r fmt(sm$r.squared)`, a skorygowany $R^2$ = `r fmt(sm$adj.r.squared)`. Model wyjaśnia zatem około `r fmt(100 * sm$r.squared, 1)` % zmienności zmiennej `r gsub("_", "\\\\_", Y)`, co `r ifelse(sm$r.squared < 0.3, "jest wartością niską – istnieją inne czynniki wpływające na zmiany rentowności, nieuwzględnione w modelu", "jest wartością umiarkowaną lub wysoką")`.
+
+# Diagnostyka modelu
+
+Wszystkie testy wykonano na poziomie istotności $\alpha$ = `r fmt(ALFA, 2)`.
+
+## Normalność reszt
+
+H0: reszty mają rozkład normalny.
+
+```{r normalnosc}
+sw <- shapiro.test(reszty)
+jb <- jarque.bera.test(reszty)
+```
+
+- Test Shapiro-Wilka: W = `r fmt(sw$statistic, 4)`, p `r fmt_p(sw$p.value)` – `r wniosek_h0(sw$p.value)`.
+- Test Jarque-Bera: JB = `r fmt(jb$statistic, 4)`, p `r fmt_p(jb$p.value)` – `r wniosek_h0(jb$p.value)`.
+
+```{r wykres-norm, fig.width=8, fig.height=3.5}
+par(mfrow = c(1, 2))
+hist(reszty, breaks = 20, prob = TRUE, main = "Histogram reszt",
+     xlab = "Reszty", ylab = "Gęstość")
+lines(density(reszty), col = "red", lwd = 2)
+curve(dnorm(x, mean(reszty), sd(reszty)), add = TRUE, col = "blue", lwd = 2)
+legend("topright", c("Empiryczna", "Normalna"), col = c("red", "blue"), lwd = 2, bty = "n")
+qqnorm(reszty, main = "Wykres Q-Q reszt", xlab = "Kwantyle teoretyczne",
+       ylab = "Kwantyle empiryczne")
+qqline(reszty, col = "red")
+```
+
+## Autokorelacja reszt
+
+H0: brak autokorelacji reszt.
+
+```{r autokorelacja}
+dw <- dwtest(model)
+lb <- Box.test(reszty, lag = min(10, floor(n_obs / 5)), type = "Ljung-Box")
+bg <- bgtest(model, order = 2)
+```
+
+- Test Durbina-Watsona: DW = `r fmt(dw$statistic, 4)`, p `r fmt_p(dw$p.value)` – `r wniosek_h0(dw$p.value)`.
+- Test Ljunga-Boxa: Q = `r fmt(lb$statistic, 4)`, p `r fmt_p(lb$p.value)` – `r wniosek_h0(lb$p.value)`.
+- Test Breuscha-Godfreya (rząd 2): LM = `r fmt(bg$statistic, 4)`, p `r fmt_p(bg$p.value)` – `r wniosek_h0(bg$p.value)`.
+
+```{r wykres-acf, fig.width=6, fig.height=3.2}
+acf(reszty, main = "Funkcja autokorelacji reszt", lag.max = 20)
+```
+
+## Heteroskedastyczność
+
+H0: homoskedastyczność (stała wariancja składnika losowego).
+
+```{r hetero}
+bp <- bptest(model)
+gq <- gqtest(model, order.by = dopas)
+```
+
+- Test Breuscha-Pagana: BP = `r fmt(bp$statistic, 4)`, p `r fmt_p(bp$p.value)` – `r wniosek_h0(bp$p.value)`.
+- Test Goldfelda-Quandta: GQ = `r fmt(gq$statistic, 4)`, p `r fmt_p(gq$p.value)` – `r wniosek_h0(gq$p.value)`.
+
+```{r wykres-hetero, fig.width=8, fig.height=3.5}
+par(mfrow = c(1, 2))
+plot(dopas, reszty, main = "Reszty vs wartości dopasowane",
+     xlab = "Wartości dopasowane", ylab = "Reszty"); abline(h = 0, col = "red")
+plot(dopas, abs(reszty), main = "|Reszty| vs wartości dopasowane",
+     xlab = "Wartości dopasowane", ylab = "|Reszty|")
+```
+
+## Współliniowość
+
+Za problematyczne uznajemy VIF > 5 (umiarkowana współliniowość) i VIF > 10 (poważna).
+
+```{r vif}
+if (length(najlepsze) > 1) {
+  max_vif <- max(vif(model))
+  tekst_vif <- paste0("Maksymalny VIF wynosi ", fmt(max_vif, 3), " – ",
+                      ifelse(max_vif < 5, "brak problemu współliniowości.",
+                             "występuje współliniowość zmiennych objaśniających."))
+} else {
+  max_vif <- NA
+  tekst_vif <- "Model ma jedną zmienną objaśniającą – współliniowość nie dotyczy."
+}
+```
+
+`r tekst_vif`
+
+## Stabilność parametrów
+
+H0 (test Chowa): parametry są stabilne. Punkt podziału znajduje się w połowie próby.
+
+```{r chow}
+chow <- sctest(formula_modelu, data = st_ucz, type = "Chow", point = floor(n_obs / 2))
+```
+
+Test Chowa: F = `r fmt(chow$statistic, 4)`, p `r fmt_p(chow$p.value)` – `r wniosek_h0(chow$p.value)`.
+
+```{r cusum, fig.width=6, fig.height=3.5}
+plot(efp(formula_modelu, data = st_ucz, type = "Rec-CUSUM"),
+     main = "Test CUSUM stabilności parametrów")
+```
+
+## Postać funkcyjna i losowość reszt
+
+```{r reset}
+reset <- resettest(model, power = 2:3, type = "fitted")
+runs  <- runs.test(factor(reszty > 0))
+```
+
+- Test RESET Ramseya (H0: poprawna postać funkcyjna): F = `r fmt(reset$statistic, 4)`, p `r fmt_p(reset$p.value)` – `r wniosek_h0(reset$p.value)`.
+- Test serii (H0: reszty są losowe): statystyka = `r fmt(runs$statistic, 4)`, p `r fmt_p(runs$p.value)` – `r wniosek_h0(runs$p.value)`.
+
+## Efekt katalizy
+
+Efekt katalizy oznacza, że jedna zmienna wpływa na siłę oddziaływania innej. Testujemy go, porównując model z modelem zawierającym interakcje dwuczynnikowe (test F dla modeli zagnieżdżonych).
+
+```{r kataliza}
+if (length(najlepsze) > 1) {
+  f_inter <- as.formula(paste(Y, "~ (", paste(najlepsze, collapse = " + "), ")^2"))
+  an <- anova(model, lm(f_inter, data = st_ucz))
+  tekst_kat <- paste0("Test F: F = ", fmt(an$F[2], 4), ", p ", fmt_p(an$`Pr(>F)`[2]),
+                      " – ", ifelse(an$`Pr(>F)`[2] < ALFA,
+                                    "efekt katalizy jest istotny.", "brak istotnego efektu katalizy."))
+} else {
+  an <- NULL
+  tekst_kat <- "Model ma jedną zmienną objaśniającą – test nie dotyczy."
+}
+```
+
+`r tekst_kat`
+
+## Koincydencja
+
+Koincydencja oznacza, że zmienna objaśniająca wpływa na zmienną objaśnianą tylko w określonych okresach. Sprawdzamy to, estymując model osobno na trzech równych podokresach próby uczącej.
+
+```{r koincydencja}
+granice <- floor(c(0, 1/3, 2/3, 1) * n_obs)
+podokresy <- lapply(1:3, function(i)
+  lm(formula_modelu, data = st_ucz[(granice[i] + 1):granice[i + 1], ]))
+tab_k <- rbind(sapply(podokresy, function(m) coef(m)),
+               "R^2" = sapply(podokresy, function(m) summary(m)$r.squared))
+colnames(tab_k) <- paste("Podokres", 1:3)
+knitr::kable(round(tab_k, 4), caption = "Parametry i R² w podokresach")
+```
+
+# Podsumowanie diagnostyki
+
+```{r podsumowanie-testow}
+testy <- data.frame(
+  Założenie = c("Normalność reszt", "Normalność reszt", "Brak autokorelacji", "Brak autokorelacji",
+                "Brak autokorelacji", "Homoskedastyczność", "Homoskedastyczność",
+                "Stabilność parametrów", "Poprawna postać funkcyjna", "Losowość reszt"),
+  Test = c("Shapiro-Wilk", "Jarque-Bera", "Durbin-Watson", "Ljung-Box", "Breusch-Godfrey",
+           "Breusch-Pagan", "Goldfeld-Quandt", "Chow", "RESET", "Serii"),
+  Statystyka = c(sw$statistic, jb$statistic, dw$statistic, lb$statistic, bg$statistic,
+                 bp$statistic, gq$statistic, chow$statistic, reset$statistic, runs$statistic),
+  p = c(sw$p.value, jb$p.value, dw$p.value, lb$p.value, bg$p.value,
+        bp$p.value, gq$p.value, chow$p.value, reset$p.value, runs$p.value)
+)
+testy$Spełnione <- ifelse(testy$p > ALFA, "tak", "nie")
+testy$Statystyka <- round(testy$Statystyka, 3)
+testy$p <- round(testy$p, 4)
+knitr::kable(testy, row.names = FALSE, caption = "Wyniki testów diagnostycznych")
+niespelnione <- unique(testy$Założenie[testy$Spełnione == "nie"])
+```
+
+`r if (length(niespelnione) == 0) "Wszystkie testowane założenia są spełnione." else paste0("Niespełnione założenia: ", paste(niespelnione, collapse = ", "), ". Pozostałe założenia są spełnione.")` `r if (is.na(max_vif)) "" else paste0("Maksymalny VIF: ", fmt(max_vif, 3), ".")`
+
+# Istotność i interpretacja parametrów
+
+Test t-Studenta weryfikuje dla każdego parametru hipotezę H0: $\beta_i = 0$ (zmienna nie ma liniowego wpływu na zmienną objaśnianą).
+
+```{r interpretacja, results="asis"}
+wsp <- sm$coefficients
+for (i in seq_len(nrow(wsp))) {
+  nazwa <- rownames(wsp)[i]
+  ist   <- wsp[i, 4] < ALFA
+  cat0 <- function(...) cat(..., "\n", sep = "")
+  cat0("- **", ifelse(nazwa == "(Intercept)", "Wyraz wolny", gsub("_", "\\\\_", nazwa)), "**: ",
+       "ocena = ", fmt(wsp[i, 1], 5), ", t = ", fmt(wsp[i, 3], 3), ", p ", fmt_p(wsp[i, 4]),
+       " – parametr ", ifelse(ist, "**istotny**", "nieistotny"), " statystycznie. ",
+       if (nazwa != "(Intercept)")
+         paste0("Wzrost zmiennej ", gsub("_", "\\\\_", nazwa), " o 0,01 wiąże się ze zmianą ",
+                gsub("_", "\\\\_", Y), " o ", fmt(wsp[i, 1] * 0.01, 5), " (ceteris paribus), ",
+                "kierunek wpływu: ", ifelse(wsp[i, 1] > 0, "dodatni", "ujemny"), "."))
+}
+```
+
+Ponieważ zmienne są logarytmowane i różnicowane, zmiana o 0,01 odpowiada w przybliżeniu 1-procentowej zmianie względnej (dla zmiennych różnicowanych jednokrotnie).
+
+# Ocena prognoz na zbiorze testowym
+
+Model, oszacowany na próbie uczącej, wykorzystano do prognozy `r Y` na zbiorze testowym (prognozy *ex post*, na podstawie rzeczywistych wartości zmiennych objaśniających). Jako punkt odniesienia użyto prognozy naiwnej zakładającej brak zmiany (`r Y` = 0).
+
+```{r prognoza}
+prog     <- predict(model, newdata = st_test)
+rzeczyw  <- st_test[[Y]]
+MAE      <- mean(abs(rzeczyw - prog))
+RMSE     <- sqrt(mean((rzeczyw - prog)^2))
+RMSE_nai <- sqrt(mean(rzeczyw^2))
+MAE_nai  <- mean(abs(rzeczyw))
+
+knitr::kable(data.frame(
+  Miara = c("MAE", "RMSE"),
+  Model = round(c(MAE, RMSE), 5),
+  `Prognoza naiwna` = round(c(MAE_nai, RMSE_nai), 5),
+  check.names = FALSE), row.names = FALSE, caption = "Błędy prognoz na zbiorze testowym")
+```
+
+```{r wykres-prognoza, fig.width=8, fig.height=3.5}
+daty_test <- daty[indeks][indeks > n_ucz]
+plot(daty_test, rzeczyw, type = "l", lwd = 2, xlab = "Data", ylab = Y,
+     main = "Wartości rzeczywiste i prognozowane (zbiór testowy)")
+lines(daty_test, prog, col = "red", lwd = 2)
+legend("topleft", c("Rzeczywiste", "Prognoza"), col = c("black", "red"), lwd = 2, bty = "n")
+```
+
+`r ifelse(RMSE < RMSE_nai, "Model ma niższy błąd RMSE niż prognoza naiwna", "Model **nie poprawia** błędu RMSE względem prognozy naiwnej")` (`r fmt(RMSE, 5)` wobec `r fmt(RMSE_nai, 5)`). Miary względne (MAPE, sMAPE) pominięto, ponieważ zmienna `r gsub("_", "\\\\_", Y)` (różnice logarytmów) przyjmuje wartości bliskie zeru i błędy procentowe są wówczas silnie zawyżone.
+
+# Podsumowanie
+
+- **Dane:** `r n` obserwacji miesięcznych (`r format(min(daty), "%m.%Y")`–`r format(max(daty), "%m.%Y")`) ze Stooq; podział na próbę uczącą (`r n_ucz` obs.) i testową (`r n - n_ucz` obs.).
+- **Selekcja:** po filtrze korelacyjnym i logarytmowaniu pozostało `r length(wybrane)` zmiennych (`r paste(wybrane, collapse = ", ")`).
+- **Stacjonarność:** rzędy różnicowania: `r paste0(names(rzedy), " – ", rzedy, collapse = "; ")`.
+- **Model (Hellwig):** `r paste(najlepsze, collapse = ", ")`; $R^2$ = `r fmt(sm$r.squared)`, skorygowany $R^2$ = `r fmt(sm$adj.r.squared)`; test F: p `r fmt_p(f_p)`.
+- **Diagnostyka:** `r if (length(niespelnione) == 0) "wszystkie założenia spełnione" else paste("niespełnione:", paste(niespelnione, collapse = ", "))`.
+- **Prognoza:** MAE = `r fmt(MAE, 5)`, RMSE = `r fmt(RMSE, 5)` (prognoza naiwna: `r fmt(RMSE_nai, 5)`).
